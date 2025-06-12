@@ -1,0 +1,13 @@
+Make sure that you are in the ‘efficientUnet-usAtlantic/notebooks’ directory
+cd /scratch/apm5rt/efficientUnet-usAtlantic/notebooks
+module load apptainer
+apptainer exec --nv ../keras-rasterio_latest.sif ipython 1-Preprocessing.py
+
+
+Training UNet in Rivanna:
+-	apptainer exec --nv ../keras-rasterio_latest.sif ipython 2-UNetTraining.py
+Displaying tensorboard from scratch in Rivanna:
+-	apptainer run ../keras-rasterio_latest.sif tensorboard --logdir logs/LOG_DIRECTORY
+Large-scale prediction in Rivanna:
+-	apptainer exec --nv ../keras-rasterio_latest.sif ipython 3-RasterAnalysis.py
+
