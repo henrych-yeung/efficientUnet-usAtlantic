@@ -6,35 +6,27 @@
 #    Author: Ankit Kariryaa, University of Bremen
 
 # In[1]:
-
+import os
+os.environ["SM_FRAMEWORK"] = "tf.keras"
 
 import tensorflow as tf
-get_ipython().run_line_magic('env', 'SM_FRAMEWORK=tf.keras')
+from tensorflow import keras
 import segmentation_models as sm
-sm.set_framework('tf.keras')
 
-import os
-import rasterio                  # I/O raster data (netcdf, height, geotiff, ...)
-import rasterio.warp             # Reproject raster samples
+import rasterio
 from rasterio import windows
-import fiona                     # I/O vector data (shape, geojson, ...)
+from rasterio.features import shapes
+from rasterio.warp import transform as warp_transform
+
 import geopandas as gps
-
-from shapely.geometry import Point, Polygon
-from shapely.geometry import mapping, shape
-
-import numpy as np               # numerical array manipulation
-import os
+import numpy as np
 from tqdm import tqdm
-import PIL.Image
-import PIL.ImageDraw
-
 from itertools import product
-import segmentation_models as sm
 from tensorflow.keras.models import load_model
+from shapely.geometry import Point, Polygon, mapping, shape
+import matplotlib.pyplot as plt
+import warnings, logging, argparse
 
-
-import sys
 from core.UNet import UNet
 from core.losses import focal_tversky, accuracy, dice_coef, dice_loss, specificity, sensitivity
 from core.optimizers import adaDelta, adagrad, adam, nadam
@@ -44,22 +36,8 @@ from core.split_frames import split_dataset
 from core.visualize import display_images
 from segmentation_models import get_preprocessing
 
-get_ipython().run_line_magic('matplotlib', 'inline')
-import matplotlib.pyplot as plt  # plotting tools
-import matplotlib.patches as patches
-from matplotlib.patches import Polygon
-
-import warnings                  # ignore annoying warnings
 warnings.filterwarnings("ignore")
-import logging
-logger = logging.getLogger()
-logger.setLevel(logging.CRITICAL)
-
-get_ipython().run_line_magic('reload_ext', 'autoreload')
-get_ipython().run_line_magic('autoreload', '2')
-from IPython.core.interactiveshell import InteractiveShell
-InteractiveShell.ast_node_interactivity = "all"
-
+logging.getLogger().setLevel(logging.CRITICAL)
 print(tf.__version__)
 
 
@@ -316,24 +294,109 @@ def create_contours_shapefile(mask, meta, out_fn):
     createShapefileObject(res, meta, out_fn)
 
 
-def writeMaskToDisk(detected_mask, detected_meta, wp, write_as_type = 'uint8', th = 0.5, create_countors = False):
-    # Convert to correct required before writing
-    if 'float' in str(detected_meta['dtype']) and 'int' in write_as_type:
-        print(f'Converting prediction from {detected_meta["dtype"]} to {write_as_type}, using threshold of {th}')
-        detected_mask[detected_mask<th]=0
-        detected_mask[detected_mask>=th]=1
-        detected_mask = detected_mask.astype(write_as_type)
-        detected_meta['dtype'] =  write_as_type
-        detected_meta['count'] = 1
-#         plt.imshow(detected_mask)
-#         plt.show()
-    with rasterio.open(wp, 'w', **detected_meta) as outds:
-        outds.write(detected_mask, 1)
-    if create_countors:
-        wp = wp.replace(image_type, output_shapefile_type)
-        create_contours_shapefile(detected_mask, detected_meta, wp)
+# def writeMaskToDisk(detected_mask, detected_meta, wp, write_as_type = 'uint8', th = 0.5, create_countors = False):
+#     # Convert to correct required before writing
+#     if 'float' in str(detected_meta['dtype']) and 'int' in write_as_type:
+#         print(f'Converting prediction from {detected_meta["dtype"]} to {write_as_type}, using threshold of {th}')
+#         detected_mask[detected_mask<th]=0
+#         detected_mask[detected_mask>=th]=1
+#         detected_mask = detected_mask.astype(write_as_type)
+#         detected_meta['dtype'] =  write_as_type
+#         detected_meta['count'] = 1
+    # with rasterio.open(wp, 'w', **detected_meta) as outds:
+    #     outds.write(detected_mask, 1)
+    # if create_countors:
+    #     wp = wp.replace(image_type, output_shapefile_type)
+    #     create_contours_shapefile(detected_mask, detected_meta, wp)
+    
+from skimage.morphology import remove_small_holes
+from shapely.geometry import shape, Polygon
+from rasterio.features import shapes
+import geopandas as gpd
+import numpy as np
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
+import scipy.ndimage as ndi
 
+def writeMaskToDisk(mask, meta, out_path, threshold=0.5, min_area=0.01, hole_size_m2=100, win_size_m=2.5, split_crowns=True):
+    """
+    Convert prediction mask to polygon GeoPackage with optional crown splitting.
 
+    Args:
+        mask (np.ndarray): 2D prediction mask.
+        meta (dict): Raster metadata.
+        out_path (str): Output path (.gpkg).
+        threshold (float): Threshold for binarization.
+        min_area (float): Minimum area to retain.
+        hole_size (int): Max hole size to fill (in pixels).
+        split_crowns (bool): Whether to apply watershed-based crown separation.
+    """
+    
+    # Get pixel size (assume square pixels)
+    res = abs(meta["transform"][0])  # meters/pixel
+    
+    # Convert m² to pixel area
+    hole_size_px = int(hole_size_m2 / (res * res))
+    
+    # Convert 10 m to pixel window size
+    win_size_px = max(3, int(win_size_m / res))  # must be odd and ≥ 3
+    
+    
+    print(f"Saving GPKG to {out_path}")
+    binary = (mask >= threshold)
+    binary = remove_small_holes(binary, area_threshold=hole_size_px, connectivity=1)
+    binary = binary.astype(np.uint8)
+
+    if split_crowns:
+        print("⚡ Splitting merged crowns with watershed...")
+        dist_transform = ndi.distance_transform_edt(binary)
+        
+        coords = peak_local_max(dist_transform, 
+        #    footprint=np.ones((win_size_px, win_size_px)), 
+            min_distance= win_size_px,
+            labels=binary)
+        peak_mask = np.zeros_like(dist_transform, dtype=bool)
+        peak_mask[tuple(coords.T)] = True
+
+        # Use 8-connectivity for marker labeling
+        markers, num_markers = ndi.label(peak_mask, structure=np.ones((3, 3)))
+
+        # Use same connectivity in watershed
+        binary_split = watershed(-dist_transform, markers=markers, mask=binary,
+            connectivity=2,  # optional: use 2 for full 8-connectivity
+            watershed_line=False
+        )
+
+    binary = np.maximum(binary, binary_split)
+    
+    transform = meta["transform"]
+    crs = meta["crs"]
+    shape_gen = shapes(binary, mask=(binary > 0), transform=transform)
+
+    polygons = []
+    for geom, val in shape_gen:
+        if val == 0:
+            continue
+        poly = shape(geom)
+        if poly.area >= min_area:
+            poly = Polygon(poly.exterior)
+            polygons.append(poly)
+
+    if not polygons:
+        print("⚠️ No valid polygons found — writing empty file.")
+        schema = {"geometry": "Polygon", "properties": {"id": "int", "area": "int"}}
+        gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
+        gdf.to_file(out_path, schema=schema, driver="GPKG")
+    else:
+        gdf = gpd.GeoDataFrame({
+            "id": range(1, len(polygons)+1),
+            "area": [p.area for p in polygons]
+        }, geometry=polygons, crs=crs)
+        gdf.to_file(out_path, driver="GPKG")
+    
+    print(f"✅ Saved {len(gdf)} polygons to {out_path}")
+
+    
 # In[7]:
 
 
@@ -435,54 +498,124 @@ def writeMaskToDisk(detected_mask, detected_meta, wp, write_as_type = 'uint8', t
 # Use the Auxiliary-2-SplitRasterToAnalyse if the images are too big to be analysed in memory.
 
 ####### Original Version (No parallel processing) #######
-# Ensure the output directory exists; if not, create one
-if not os.path.exists(config.output_dir):
-    os.makedirs(config.output_dir)
+import time, random
 
-all_files = []
-for root, dirs, files in os.walk(config.input_image_dir):
-    for file in files:
-        if file.endswith(config.input_image_type) and file.startswith(config.ndvi_fn_st):
-            all_files.append((os.path.join(root, file), file))
-for fullPath, filename in all_files:
-    outputFile = os.path.join(config.output_dir, filename.replace(config.ndvi_fn_st, config.output_prefix))
-    if not os.path.isfile(outputFile) or config.overwrite_analysed_files: 
-        with rasterio.open(fullPath) as ndvi:
-            with rasterio.open(fullPath.replace(config.ndvi_fn_st, config.pan_fn_st)) as pan:
-                print(fullPath)
-                detectedMask, detectedMeta = detect_tree(ndvi, pan, width = config.WIDTH, height = config.HEIGHT, stride = config.STRIDE, preprocess=config.PREPROCESS) # WIDTH and HEIGHT should be the same and in this case Stride is 50 % width
-#               #Write the mask to file
-                writeMaskToDisk(detectedMask, detectedMeta, outputFile, write_as_type = config.output_dtype, th = 0.5, create_countors = False)                
-    else:
-        print('File already analysed!', fullPath)
-print(all_files)
+def main():
+    print('🚀 Starting raster analysis...')
 
-# In[10]:
+    # --- Load default config ---
+    config = RasterAnalysis.Configuration()
+
+    # --- Parse CLI arguments (optional override) ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", help="Input directory containing image tiles")
+    parser.add_argument("--output", help="Output directory for predicted .gpkg files")
+    parser.add_argument("--stable_min", type=float, default=0,
+                    help="Minimum file age (minutes) before processing (to skip files still being written)")
+    args = parser.parse_args()
+
+    # --- Use CLI arguments if provided, else fallback to config defaults ---
+    input_dir = args.input or config.input_image_dir
+    output_dir = args.output or config.output_dir
+
+    print(f"📂 Input directory: {input_dir}")
+    print(f"💾 Output directory: {output_dir}")
+
+    # --- Update config paths dynamically ---
+    config.input_image_dir = input_dir
+    config.output_dir = output_dir
+
+    # --- Ensure output directory exists ---
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    # --- Collect all NDVI files ---
+    all_files = []
+    for root, _, files in os.walk(config.input_image_dir):
+        for file in files:
+            if file.endswith(config.input_image_type) and file.startswith(config.ndvi_fn_st):
+                all_files.append((os.path.join(root, file), file))
+
+    if not all_files:
+        print(f"⚠️ No input files found in {config.input_image_dir}")
+        return
+
+    # --- Filter out files modified within the last N minutes ---
+    if args.stable_min > 0:
+        now = time.time()
+        stable_files = []
+        for fullPath, filename in all_files:
+            try:
+                age_min = (now - os.path.getmtime(fullPath)) / 60
+                if age_min >= args.stable_min:
+                    stable_files.append((fullPath, filename))
+                else:
+                    print(f"⏸️ Skipping (modified {age_min:.1f} min ago): {filename}")
+            except Exception as e:
+                print(f"⚠️ Could not check modification time for {filename}: {e}")
+
+        all_files = stable_files
+        print(f"✅ Found {len(all_files)} TIFFs older than {args.stable_min} min.")
+        if not all_files:
+            print("⚠️ No stable TIFFs found. Exiting.")
+            return
 
 
-# # Display extracted image
-# sampleImage = 'm_3507518_ne_18_060_20200516.tif'
-# fn = os.path.join(config.output_dir, config.output_prefix + sampleImage )
-# predicted_img = rasterio.open(fn)
-# p = predicted_img.read()
-# np.unique(p, return_counts=True)
-# plt.imshow(p[0])
+    # --- Shuffle order: each server gets different random sequence ---
+    random.seed(os.getpid() + int(time.time()))
+    random.shuffle(all_files)
+    
+    # --- Process each file ---
+    for fullPath, filename in all_files:
+        rel_dir = os.path.relpath(os.path.dirname(fullPath), config.input_image_dir)
+
+        # Add "_vect" directly to the last folder in the relative path
+        parent_dir = os.path.dirname(rel_dir)
+        folder_name = os.path.basename(rel_dir)
+        rel_dir_vect = os.path.join(parent_dir, folder_name + "_vect") if parent_dir else folder_name + "_vect"
+
+        out_subdir = os.path.join(config.output_dir, rel_dir_vect)
+        os.makedirs(out_subdir, exist_ok=True)
+
+        outputFile = os.path.join(out_subdir, filename.replace(config.ndvi_fn_st, config.output_prefix))
+        gpkg_path = outputFile.replace(config.output_image_type, config.output_shapefile_type)
+
+        # Skip if output already exists and overwrite is disabled
+        if os.path.isfile(gpkg_path) and not config.overwrite_analysed_files:
+            print(f"⏩ Skipping already processed file: {gpkg_path}")
+            continue
+
+        try:
+            with rasterio.open(fullPath) as ndvi, rasterio.open(fullPath.replace(config.ndvi_fn_st, config.pan_fn_st)) as pan:
+                print(f"🛰️ Processing: {fullPath}")
+                detectedMask, detectedMeta = detect_tree(
+                    ndvi,
+                    pan,
+                    width=config.WIDTH,
+                    height=config.HEIGHT,
+                    stride=config.STRIDE,
+                    preprocess=config.PREPROCESS
+                )
+
+                # Overwrite if file appears during processing
+                if os.path.isfile(gpkg_path):
+                    print(f"⚠️ Output already exists, overwriting: {gpkg_path}")
+
+                writeMaskToDisk(
+                    detectedMask,
+                    detectedMeta,
+                    gpkg_path,
+                    threshold=0.5,
+                    split_crowns=config.split_crowns
+                )
+
+        except Exception as e:
+            print(f"❌ Error processing {filename}: {e}")
+
+    print("✅ All processing complete!")
 
 
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
+if __name__ == "__main__":
+    main()
+    print('endddddd')
 
 

@@ -1,11 +1,15 @@
 # Make sure you use the A100 or V100 GPU on Rivanna.
 
 # Make sure that you are in the ‘efficientUnet-usAtlantic/notebooks’ directory
-cd /scratch/apm5rt/efficientUnet-usAtlantic/notebooks
+#cd efficientUnet-usAtlantic/notebooks
 module load apptainer
-apptainer exec --nv ../keras-rasterio_latest.sif ipython 1-Preprocessing.py
+apptainer exec --nv ../keras-rasterio_latest.sif python 3-RasterAnalysis.py \
+  --input /scratch/apm5rt/NAIP_1m/NAIP_AL_2013 \
+  --output /scratch/apm5rt/segmentation_1m
 
 
+Preprocessing images and labels in Rivanna (Not yet working):
+-   apptainer exec --nv ../keras-rasterio_latest.sif ipython 1-Preprocessing.py
 Training UNet in Rivanna:
 -	apptainer exec --nv ../keras-rasterio_latest.sif ipython 2-UNetTraining.py
 Displaying tensorboard from scratch in Rivanna:
@@ -15,3 +19,8 @@ Large-scale prediction in Rivanna:
 
 bash batch_sieving.sh . .
 bash batch_polygonize.sh . .
+
+
+module load gcc/14.2.0
+source env/bin/activate
+python3 -m 3-RasterAnalysis

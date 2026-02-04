@@ -1,1 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (adjust!)
+data/
+*.tif
+*.tiff
+*.jp2
+*.h5
+*.hdf5
+*.nc
+
+# Models
+*.pth
+*.ckpt
+*.h5
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+._*
+.AppleDouble
+
+# Temporary / backup
+*~
 
