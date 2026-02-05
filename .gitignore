@@ -18,6 +18,7 @@ data/
 *.h5
 *.hdf5
 *.nc
+*.sif
 
 # Models
 *.pth
